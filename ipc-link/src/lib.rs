@@ -62,14 +62,16 @@ impl IpcLinkMaster {
         serde_json::to_writer(&mut self.tx, &cmd).unwrap();
         self.tx.write_all(b"\n").unwrap();
         self.tx.flush().unwrap();
-
+    
         loop {
-            let line = self.read_line().unwrap_or_else(|_| {
-                return IpcResponse::Err("failed to read from recorder".into());
-            });
-            match serde_json::from_str::<IpcResponse>(&line) {
-                Ok(response) => return response,
-                Err(_) => println!("[rec]: {}", line.trim_end()),
+            match self.read_line() {
+                Ok(line) => {
+                    match serde_json::from_str::<IpcResponse>(&line) {
+                        Ok(response) => return response,
+                        Err(_) => println!("[rec]: {}", line.trim_end()),
+                    }
+                },
+                Err(e) => return IpcResponse::Err(format!("Failed to read from recorder: {}", e)),
             }
         }
     }
@@ -137,64 +139,5 @@ impl IpcLinkSlave {
 impl Default for IpcLinkSlave {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-pub struct Recorder {
-    ipc: IpcLinkSlave,
-    rec_inner: Option<RecorderInner>,
-}
-
-impl Recorder {
-    pub fn new() -> Self {
-        Self {
-            ipc: IpcLinkSlave::new(),
-            rec_inner: None,
-        }
-    }
-
-    pub fn run(&mut self) {
-        self.ipc.respond(|cmd| {
-            match cmd {
-                IpcCommand::Init { fps_num, fps_den, screen_width, screen_height, process_name } => {
-                    self.rec_inner = Some(RecorderInner::new(fps_num, fps_den, screen_width, screen_height, &process_name));
-                    Some(IpcResponse::Ok)
-                }
-                IpcCommand::StartRecording { filename } => {
-                    if let Some(ref mut rec) = self.rec_inner {
-                        match rec.start_recording(&filename) {
-                            Ok(_) => Some(IpcResponse::Ok),
-                            Err(e) => Some(IpcResponse::Err(e.to_string())),
-                        }
-                    } else {
-                        Some(IpcResponse::Err("Recorder not initialized".into()))
-                    }
-                }
-                IpcCommand::StopRecording => {
-                    if let Some(ref mut rec) = self.rec_inner {
-                        match rec.stop_recording() {
-                            Ok(_) => Some(IpcResponse::Ok),
-                            Err(e) => Some(IpcResponse::Err(e.to_string())),
-                        }
-                    } else {
-                        Some(IpcResponse::Err("Recorder not initialized".into()))
-                    }
-                }
-                IpcCommand::IsRecording => {
-                    if let Some(ref rec) = self.rec_inner {
-                        Some(IpcResponse::Recording(rec.is_recording()))
-                    } else {
-                        Some(IpcResponse::Recording(false))
-                    }
-                }
-                IpcCommand::Shutdown => {
-                    if let Some(ref mut rec) = self.rec_inner {
-                        rec.shutdown();
-                    }
-                    Some(IpcResponse::Ok)
-                }
-                IpcCommand::Exit => None,
-            }
-        });
     }
 }

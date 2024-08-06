@@ -38,11 +38,11 @@ edition = "2021"
 
 [lib]
 name = "win_recorder"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "recorder"
-path = "src/bin/recorder.rs"
+path = "src/main.rs"
 
 [dependencies]
 ipc-link = { path = "ipc-link" }

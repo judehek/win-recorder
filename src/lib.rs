@@ -1,9 +1,7 @@
 use std::{error, fmt, io, path};
 use serde::{Deserialize, Serialize};
 
-pub use crate::ipc_link::{IpcCommand, IpcLinkMaster, IpcResponse};
-
-mod ipc_link;
+pub use ipc_link::{IpcCommand, IpcLinkMaster, IpcResponse};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecorderSettings {
