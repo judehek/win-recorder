@@ -1,0 +1,13 @@
+[package]
+name = "ipc-link"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dependencies.windows]
+workspace = true
