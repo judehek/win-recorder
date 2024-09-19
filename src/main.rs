@@ -1,6 +1,7 @@
 use log::{debug, error, info, trace, warn, LevelFilter};
 use logger::setup_logger;
 use thiserror::Error;
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
 use windows::{
     core::*,
     Win32::Media::MediaFoundation::*,
@@ -316,67 +317,88 @@ unsafe fn collect_frames(
     width: u32,
     height: u32,
     started: Arc<Barrier>,
-    device: Arc<ID3D11Device>,
     context_mutex: Arc<Mutex<ID3D11DeviceContext>>
 ) -> Result<()> {
     info!("Starting frame collection");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-    // Get DXGI device
-    let dxgi_device: IDXGIDevice = device.cast()?;
 
-    // Get DXGI adapter
-    let dxgi_adapter: IDXGIAdapter = dxgi_device.GetAdapter()?;
+    // Get the monitor of the window
+    let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
 
-    // Get output
-    let output = dxgi_adapter.EnumOutputs(0)?;
+    // Create DXGIFactory
+    let dxgi_factory: IDXGIFactory1 = CreateDXGIFactory1()?;
 
-    // Get output1
-    let output1: IDXGIOutput1 = output.cast()?;
+    // Enumerate adapters and outputs to find the matching monitor
+    let mut found_output: Option<IDXGIOutput1> = None;
+    'outer: for adapter_index in 0.. {
+        let dxgi_adapter = match dxgi_factory.EnumAdapters(adapter_index) {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+
+        for output_index in 0.. {
+            let dxgi_output = match dxgi_adapter.EnumOutputs(output_index) {
+                Ok(output) => output,
+                Err(_) => break,
+            };
+
+            let mut desc = DXGI_OUTPUT_DESC::default();
+            dxgi_output.GetDesc(&mut desc)?;
+            if desc.Monitor == hmonitor {
+                found_output = Some(dxgi_output.cast()?);
+                break 'outer;
+            }
+        }
+    }
+
+    let output1 = found_output.ok_or_else(|| Error::new(E_FAIL, "No matching output found".into()))?;
+
+    // Get the adapter from the output
+    let output: IDXGIOutput = output1.cast()?;
+    let dxgi_adapter: IDXGIAdapter = unsafe {
+        output.GetParent()?
+    };
+
+    // Create the D3D11 device on this adapter
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+    let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+    D3D11CreateDevice(
+        Some(&dxgi_adapter),
+        D3D_DRIVER_TYPE_UNKNOWN,
+        None,
+        flags,
+        Some(&feature_levels),
+        D3D11_SDK_VERSION,
+        Some(&mut device),
+        None,
+        Some(&mut context),
+    )?;
+
+    let device = device.unwrap();
+    let context = context.unwrap();
 
     // Create desktop duplication
-    let duplication = output1.DuplicateOutput(&*device)?;
-    //let supported_formats = [DXGI_FORMAT_B8G8R8A8_UNORM];
-    //let duplication = output1.DuplicateOutput1(&device, 0, &supported_formats)?;
-
+    let duplication = output1.DuplicateOutput(&device)?;
 
     let frame_duration = Duration::from_nanos(1_000_000_000 * fps_den as u64 / fps_num as u64);
     let mut next_frame_time = Instant::now();
     let mut frame_count = 0;
-    // let start = Instant::now();
-
-    // let mut last_frame_overran = false;
     let mut accumulated_delay = Duration::ZERO;
     let mut num_duped = 0;
-
-    /*let mut staging_texture: Option<ID3D11Texture2D> = None;
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = D3D11_BIND_FLAG(0);
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_FLAG(0);
-    device.CreateTexture2D(&desc, None, Some(&mut staging_texture))?;
-    println!("test");
-    let staging_texture = staging_texture.unwrap();*/
 
     let (blank_texture, _blank_resource) = create_blank_dxgi_texture(&device, width, height)?;
 
     println!("GOT TO WAIT");
     started.wait();
     while recording.load(Ordering::Relaxed) {
-        //let mut frame_start = Instant::now();
-
         let mut resource: Option<IDXGIResource> = None;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
 
         let foreground_window = GetForegroundWindow();
         let is_target_window = foreground_window == hwnd;
-        // println!("Init: {:?}", frame_start.elapsed());
 
         // Acquire next frame
         match duplication.AcquireNextFrame(0, &mut info, &mut resource) {
@@ -411,26 +433,6 @@ unsafe fn collect_frames(
                         );
                     }
                     drop(context);
-
-                    /*let context = context_mutex.lock().unwrap();
-                    let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
-                    context.Map(
-                        &staging_texture,
-                        0,
-                        D3D11_MAP_READ,
-                        0,
-                        Some(&mut mapped_resource),
-                    )?;
-
-                    let data_slice = std::slice::from_raw_parts(
-                        mapped_resource.pData as *const u8,
-                        (width * height * 4) as usize,
-                    );
-
-                    // Log first 100 bytes of frame data
-                    info!("Frame {} data (first 100 bytes): {:?}", frame_count, &data_slice[..100]);
-
-                    context.Unmap(&staging_texture, 0);*/
 
                     while accumulated_delay >= frame_duration {
                         println!("Duping a frame to catch up");
@@ -469,9 +471,6 @@ unsafe fn collect_frames(
                     // Release frame
                     duplication.ReleaseFrame()?;
                     trace!("Collected frame {}", frame_count);
-
-                    // Temp sleep
-                    //std::thread::sleep(Duration::from_millis(500));
                 }
             }
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -481,7 +480,6 @@ unsafe fn collect_frames(
             Err(error) => return Err(error),
         }
     }
-
 
     info!("Frame collection finished. Number of duped: {}", num_duped);
     Ok(())
@@ -867,7 +865,7 @@ impl RecorderInner {
             let rec_clone = recording.clone();
             let barrier_clone_video = barrier.clone();
             collect_video_handle = Some(std::thread::spawn(move || {
-                collect_frames(sender, rec_clone, hwnd, fps_num, fps_den, screen_width, screen_height, barrier_clone_video, dev_clone, context_mutex)
+                collect_frames(sender, rec_clone, hwnd, fps_num, fps_den, screen_width, screen_height, barrier_clone_video, context_mutex)
             }));
 
             if capture_audio {
