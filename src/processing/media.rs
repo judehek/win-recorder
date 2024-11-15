@@ -1,10 +1,131 @@
 use std::ptr;
 
-use windows::core::{ComInterface, Result};
+use log::{error, info};
+use windows::core::{Array, ComInterface, IUnknown, Result};
 use windows::Win32::Foundation::TRUE;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+
+use crate::recorder::get_string_attribute;
+
+unsafe fn get_encoder_by_name(encoder_name: &str) -> Result<IMFTransform> {
+    let mut data = std::ptr::null_mut();
+    let mut len = 0;
+
+    info!("Searching for encoder: {}", encoder_name);
+
+    // Use more complete enumeration flags
+    let enum_flags = MFT_ENUM_FLAG_HARDWARE
+        | MFT_ENUM_FLAG_SYNCMFT
+        | MFT_ENUM_FLAG_ASYNCMFT
+        | MFT_ENUM_FLAG_SORTANDFILTER
+        | MFT_ENUM_FLAG_ALL;
+
+    MFTEnumEx(
+        MFT_CATEGORY_VIDEO_ENCODER,
+        enum_flags,
+        None,
+        None,
+        &mut data,
+        &mut len,
+    )?;
+
+    info!("Found {} encoders", len);
+
+    let activates = Array::<IMFActivate>::from_raw_parts(data as _, len);
+    let mut selected_activate = None;
+    let mut found_encoders = std::collections::HashSet::new();
+
+    // Look for matching encoder
+    for activate in activates.as_slice() {
+        let activate = activate.clone().unwrap();
+
+        if let Ok(Some(name)) = get_string_attribute(
+            activate.cast::<IMFAttributes>().as_ref().unwrap(),
+            &MFT_FRIENDLY_NAME_Attribute,
+        ) {
+            if !found_encoders.contains(&name) {
+                info!("Found unique encoder: {}", name);
+                found_encoders.insert(name.clone());
+
+                if name.to_lowercase().contains(&encoder_name.to_lowercase()) {
+                    info!("Selected encoder: {}", name);
+                    selected_activate = Some(activate);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Try to activate the selected encoder with proper error handling
+    if let Some(activate) = selected_activate {
+        match activate.ActivateObject::<IMFTransform>() {
+            Ok(transform) => {
+                info!("Successfully activated encoder transform");
+
+                // Store the transform in a variable to ensure it lives long enough
+                let transform_ref = &transform;
+
+                // Try to get attributes using the reference
+                match transform_ref.cast::<IMFAttributes>() {
+                    Ok(attributes) => {
+                        info!("Successfully got encoder attributes");
+
+                        // Verify the transform can handle the required input/output
+                        if let Err(e) = verify_encoder_compatibility(transform_ref) {
+                            error!("Encoder compatibility check failed: {:?}", e);
+                            return create_software_encoder();
+                        }
+
+                        return Ok(transform);
+                    }
+                    Err(e) => {
+                        error!("Failed to get encoder attributes: {:?}", e);
+                        // Fall through to software encoder
+                    }
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to activate encoder (code: {:x}): {:?}",
+                    e.code().0,
+                    e
+                );
+            }
+        }
+    }
+
+    info!("Falling back to software encoder");
+    create_software_encoder()
+}
+
+unsafe fn verify_encoder_compatibility(transform: &IMFTransform) -> Result<()> {
+    // Check input/output stream info
+    let mut input_info = MFT_INPUT_STREAM_INFO::default();
+    transform.GetInputStreamInfo(0, &mut input_info)?;
+
+    let output_info = transform.GetOutputStreamInfo(0)?;
+
+    // Convert the i32 constant to u32 before the bitwise operation
+    if (input_info.dwFlags & (MFT_INPUT_STREAM_WHOLE_SAMPLES.0 as u32)) == 0 {
+        return Err(windows::core::Error::new(
+            MF_E_NOT_FOUND,
+            "Encoder doesn't support whole samples".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+unsafe fn create_software_encoder() -> Result<IMFTransform> {
+    CoCreateInstance::<Option<&IUnknown>, IMFTransform>(
+        &CLSID_MSH264EncoderMFT,
+        None,
+        CLSCTX_INPROC_SERVER,
+    )
+}
 
 pub unsafe fn create_sink_writer(
     filename: &str,
@@ -13,7 +134,13 @@ pub unsafe fn create_sink_writer(
     s_width: u32,
     s_height: u32,
     capture_audio: bool,
+    encoder_name: Option<&str>,
 ) -> Result<IMFSinkWriter> {
+    info!(
+        "Creating sink writer with encoder preference: {:?}",
+        encoder_name
+    );
+
     // Create and configure attributes
     let attributes = create_sink_attributes()?;
 
@@ -24,12 +151,30 @@ pub unsafe fn create_sink_writer(
         attributes.as_ref(),
     )?;
 
-    // Configure video stream
-    configure_video_stream(&sink_writer, fps_num, fps_den, s_width, s_height)?;
+    // Configure video stream with detailed logging
+    info!("Configuring video stream...");
+    match configure_video_stream(
+        &sink_writer,
+        fps_num,
+        fps_den,
+        s_width,
+        s_height,
+        encoder_name,
+    ) {
+        Ok(_) => info!("Video stream configured successfully"),
+        Err(e) => {
+            error!("Failed to configure video stream: {:?}", e);
+            return Err(e);
+        }
+    }
 
     // Configure audio stream if needed
     if capture_audio {
-        configure_audio_stream(&sink_writer)?;
+        info!("Configuring audio stream...");
+        if let Err(e) = configure_audio_stream(&sink_writer) {
+            error!("Failed to configure audio stream: {:?}", e);
+            return Err(e);
+        }
     }
 
     Ok(sink_writer)
@@ -53,21 +198,96 @@ unsafe fn configure_video_stream(
     fps_den: u32,
     width: u32,
     height: u32,
+    encoder_name: Option<&str>,
 ) -> Result<()> {
-    // Create output media type
-    let video_output_type = create_video_output_type(fps_num, fps_den, width, height)?;
+    info!("Configuring video stream with encoder: {:?}", encoder_name);
 
-    // Create input media type
+    // Create output and input types first
+    let video_output_type = create_video_output_type(fps_num, fps_den, width, height)?;
     let video_input_type = create_video_input_type(fps_num, fps_den, width, height)?;
 
-    // Configure encoder
-    let config_attrs = create_encoder_config()?;
+    // Create base encoder config
+    let mut config_attrs = create_encoder_config()?;
+
+    // If specific encoder requested, try to use it
+    if let Some(name) = encoder_name {
+        info!("Attempting to get encoder: {}", name);
+        match get_encoder_by_name(name) {
+            Ok(encoder) => {
+                info!("Successfully got encoder: {}", name);
+
+                // Safely try to get encoder attributes
+                match encoder.cast::<IMFAttributes>() {
+                    Ok(transform_attrs) => {
+                        info!("Successfully got encoder attributes");
+
+                        // Update config attributes with encoder-specific settings
+                        if let Some(attrs) = &mut config_attrs {
+                            info!("Setting encoder-specific attributes");
+
+                            // Safely try to set the encoder
+                            if let Err(e) = attrs.SetUnknown(&MF_TRANSFORM_ASYNC_UNLOCK, &encoder) {
+                                error!("Failed to set encoder in attributes: {:?}", e);
+                                // Continue anyway, might work without this
+                            }
+
+                            // For AMD encoders
+                            if name.contains("AMD") {
+                                info!("Applying AMD-specific settings");
+
+                                // Set AMD-specific attributes
+                                let _ = attrs.SetUINT32(
+                                    &CODECAPI_AVEncCommonRateControlMode,
+                                    eAVEncCommonRateControlMode_Quality.0.try_into().unwrap(),
+                                );
+
+                                // Try setting AMD VCE specific attributes
+                                let _ = attrs.SetUINT32(&CODECAPI_AVEncCommonQuality, 80);
+                                let _ = attrs.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, 5000000);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to get encoder attributes: {:?}", e);
+                        // Continue anyway, might work with default settings
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to get encoder {}: {:?}", name, e);
+                info!("Falling back to default encoder configuration");
+            }
+        }
+    }
 
     // Add stream and set input type
-    let stream_index = sink_writer.AddStream(&video_output_type)?;
-    sink_writer.SetInputMediaType(stream_index, &video_input_type, config_attrs.as_ref())?;
+    info!("Adding stream with video output type");
+    let stream_index = match sink_writer.AddStream(&video_output_type) {
+        Ok(index) => index,
+        Err(e) => {
+            error!("Failed to add stream: {:?}", e);
+            return Err(e);
+        }
+    };
 
-    Ok(())
+    info!("Setting input media type with config attributes");
+    match sink_writer.SetInputMediaType(stream_index, &video_input_type, config_attrs.as_ref()) {
+        Ok(_) => {
+            info!("Successfully set input media type");
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to set input media type: {:?}", e);
+
+            // If we failed with custom attributes, try again with default settings
+            if config_attrs.is_some() {
+                info!("Retrying with default settings (no config attributes)");
+                sink_writer.SetInputMediaType(stream_index, &video_input_type, None)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 unsafe fn create_video_output_type(
@@ -105,7 +325,9 @@ unsafe fn create_video_input_type(
 ) -> Result<IMFMediaType> {
     let input_type: IMFMediaType = MFCreateMediaType()?;
     input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+
     input_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+
     input_type.SetUINT64(
         &MF_MT_FRAME_RATE,
         ((fps_num as u64) << 32) | (fps_den as u64),
@@ -113,8 +335,6 @@ unsafe fn create_video_input_type(
     input_type.SetUINT64(&MF_MT_FRAME_SIZE, ((width as u64) << 32) | (height as u64))?;
     input_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
     input_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-    input_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1u64)?;
-    input_type.SetUINT32(&MF_MT_DEFAULT_STRIDE, width as u32)?;
 
     Ok(input_type)
 }

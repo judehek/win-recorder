@@ -23,8 +23,16 @@ pub struct RecorderInner {
 }
 
 impl RecorderInner {
-    pub fn init(filename: &str, config: &RecorderConfig, process_name: &str) -> Result<Self> {
-        info!("Initializing recorder for process: {}", process_name);
+    pub fn init(
+        filename: &str,
+        config: &RecorderConfig,
+        process_name: &str,
+        encoder_name: Option<&str>,
+    ) -> Result<Self> {
+        info!(
+            "Initializing recorder for process: {} with encoder: {:?}",
+            process_name, encoder_name
+        );
 
         // Clone the necessary values from config at the start
         let fps_num = config.fps_num();
@@ -50,11 +58,12 @@ impl RecorderInner {
                 screen_width,
                 screen_height,
                 capture_audio,
+                encoder_name, // Pass through to media module
             )?;
 
             // Find target window
             let hwnd = find_window_by_substring(process_name)
-                .ok_or_else(|| RecorderError::FailedToStart("No Window Found".to_string()))?;
+                .ok_or_else(|| RecorderError::FailedToStart("No window found".to_string()))?;
 
             // Get the process ID
             let mut process_id: u32 = 0;
