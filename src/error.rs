@@ -6,7 +6,7 @@ use windows::core::HSTRING;
 
 pub type Result<T> = std::result::Result<T, RecorderError>;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum RecorderError {
     #[error("Windows API error: {0}")]
     Windows(#[from] core::Error),
